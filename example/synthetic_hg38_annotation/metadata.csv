@@ -1,0 +1,9 @@
+sample_id,condition,batch
+Hg01,reference,batch_a
+Hg02,reference,batch_b
+Hg03,reference,batch_a
+Hg04,reference,batch_b
+Hg05,perturbed,batch_a
+Hg06,perturbed,batch_b
+Hg07,perturbed,batch_a
+Hg08,perturbed,batch_b
