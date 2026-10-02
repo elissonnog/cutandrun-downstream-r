@@ -1,0 +1,167 @@
+---
+title: "CUT&RUN downstream analysis"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+params:
+  config_path: null
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = TRUE, message = TRUE, fig.width = 8, fig.height = 5.5)
+source(file.path("R", "helpers.R"))
+config <- load_analysis_config(params$config_path)
+plot_label <- if (grepl("SYNTHETIC", config$data_label, ignore.case = TRUE)) "SYNTHETIC DEMO" else config$data_label
+resolve_project_path <- function(path) {
+  if (grepl("^/", path)) path else file.path(getwd(), path)
+}
+inputs <- read_peak_counts(resolve_project_path(config$counts_path), config$coordinate_system)
+metadata <- read_sample_metadata(resolve_project_path(config$metadata_path))
+contrasts <- read_contrasts(resolve_project_path(config$contrasts_path))
+metadata <- validate_analysis_inputs(inputs$counts, metadata, contrasts, config$design)
+paths <- prepare_output_directories(resolve_project_path(config$output_dir))
+peak_reference <- inputs$peaks
+if (isTRUE(config$annotation$enabled)) {
+  peak_reference <- annotate_peaks_optional(inputs$peaks, config)
+  write.csv(peak_reference, file.path(paths[["tables"]], "peak_annotation.csv"), row.names = FALSE)
+}
+dds <- prepare_deseq_dataset(
+  inputs$counts, metadata, config$design, config$min_total_count,
+  config$normalization, project_root = getwd()
+)
+dds <- fit_deseq_model(dds)
+transformed <- transform_for_visualization(dds)
+```
+
+# Scope and identity
+
+**`r config$project_title`**
+
+**Data status:** `r config$data_label`
+
+This downstream report starts from an explicit consensus-peak-by-sample integer count matrix. It does not call peaks, count BAM files, reproduce upstream alignment QC, or run DiffBind. Peak coordinates remain stable identifiers throughout the analysis.
+
+```{r run-metadata}
+run_metadata <- data.frame(
+  field = c("data_label", "genome_build", "input_coordinate_system", "analysis_coordinate_system",
+            "design", "normalization", "minimum_total_count", "fdr",
+            "input_peaks", "retained_peaks", "samples", "annotation_enabled"),
+  value = c(config$data_label, config$genome_build, config$coordinate_system,
+            "one_based_closed", config$design, config$normalization$method,
+            config$min_total_count, config$fdr, nrow(inputs$counts), nrow(dds),
+            ncol(inputs$counts), isTRUE(config$annotation$enabled))
+)
+write.csv(run_metadata, file.path(paths[["tables"]], "run_metadata.csv"), row.names = FALSE)
+knitr::kable(run_metadata)
+```
+
+# Normalization limitation
+
+```{r normalization-note, results='asis'}
+if (identical(config$normalization$method, "deseq2_median_ratio")) {
+  cat("DESeq2 median-of-ratios normalization is used here. It estimates **relative** occupancy under the assumption that most retained peaks do not shift together. A widespread CUT&RUN occupancy change can violate that assumption, so this run alone cannot establish a global gain or loss of signal. If validated spike-in or other external scaling factors are available, rerun with `provided_deseq2_size_factors` and document how those factors were derived.\n")
+} else {
+  cat("Externally supplied `deseq2_size_factor` divisors are used: normalized count = count / factor. A multiplicative spike-in scaling convention must therefore be inverted before use here, with its provenance documented. This report validates values, sample matching, and assignment order but cannot validate the experimental control or biological assumptions.\n")
+}
+```
+
+# Sample QC
+
+```{r library-qc}
+library_qc <- make_library_qc_plot(inputs$counts, metadata,
+  paste(plot_label, "library depth and detected peaks", sep = " - "))
+save_ggplot(library_qc, file.path(paths[["figures"]], "library_qc.png"))
+library_qc
+```
+
+```{r pca}
+pca_plot <- make_pca_plot(transformed, metadata, config$pca_top_peaks,
+  paste(plot_label, "variance-stabilized peak-count PCA", sep = " - "))
+save_ggplot(pca_plot, file.path(paths[["figures"]], "pca.png"))
+pca_plot
+```
+
+```{r correlation}
+correlation_path <- file.path(paths[["figures"]], "sample_correlation.png")
+save_correlation_heatmap(transformed, correlation_path,
+  paste(plot_label, "sample correlation", sep = " - "))
+knitr::include_graphics(correlation_path)
+```
+
+```{r normalized-counts}
+normalized <- as.data.frame(DESeq2::counts(dds, normalized = TRUE), check.names = FALSE)
+normalized$peak_id <- rownames(normalized)
+normalized <- merge(inputs$peaks, normalized, by = "peak_id", sort = FALSE)
+write.csv(normalized, file.path(paths[["tables"]], "normalized_peak_counts.csv"), row.names = FALSE)
+size_factor_table <- data.frame(sample_id = colnames(dds), deseq2_size_factor = DESeq2::sizeFactors(dds))
+write.csv(size_factor_table, file.path(paths[["tables"]], "size_factors.csv"), row.names = FALSE)
+knitr::kable(size_factor_table, digits = 4, caption = "Size factors used in the fitted model")
+```
+
+# Differential peaks
+
+```{r differential, results='asis'}
+result_list <- vector("list", nrow(contrasts))
+names(result_list) <- contrasts$label
+summary_rows <- vector("list", nrow(contrasts))
+
+for (index in seq_len(nrow(contrasts))) {
+  contrast <- contrasts[index, , drop = FALSE]
+  label <- contrast$label[[1L]]
+  stem <- safe_file_stem(label)
+  result <- run_deseq_contrast(dds, contrast, config$fdr)
+  result <- merge(peak_reference, result, by = "peak_id", sort = FALSE)
+  result <- result[order(result$padj, -abs(result$log2FoldChange), na.last = TRUE), ]
+  result_list[[label]] <- result
+  write.csv(result, file.path(paths[["tables"]], paste0(stem, "_deseq2.csv")), row.names = FALSE)
+
+  summary_rows[[index]] <- data.frame(
+    contrast = label,
+    tested = sum(!is.na(result$pvalue)),
+    significant = sum(result$significant, na.rm = TRUE),
+    increased = sum(result$direction == "increased", na.rm = TRUE),
+    decreased = sum(result$direction == "decreased", na.rm = TRUE)
+  )
+
+  volcano <- make_volcano_plot(result, label, config$fdr, plot_label)
+  save_ggplot(volcano, file.path(paths[["figures"]], paste0(stem, "_volcano.png")))
+  heatmap_path <- file.path(paths[["figures"]], paste0(stem, "_top_peaks_heatmap.png"))
+  save_top_peak_heatmap(transformed, heatmap_path, result, config$heatmap_top_peaks,
+    paste(plot_label, label, "top differential peaks", sep = " - "))
+
+  cat("\n## ", label, "\n\n", sep = "")
+  print(volcano)
+  cat("\n")
+  print(knitr::include_graphics(heatmap_path))
+  cat("\n")
+}
+
+result_summary <- do.call(rbind, summary_rows)
+write.csv(result_summary, file.path(paths[["tables"]], "contrast_summary.csv"), row.names = FALSE)
+```
+
+```{r result-summary}
+knitr::kable(result_summary, caption = "Differential peak summary")
+```
+
+# Optional genomic annotation
+
+```{r annotation, results='asis'}
+if (isTRUE(config$annotation$enabled)) {
+  cat("Annotation completed with `", config$annotation$txdb_package,
+      "` and `", config$annotation$orgdb_package,
+      "`. Build and seqname compatibility were checked before annotation; annotation columns are included in each contrast result.\n", sep = "")
+} else {
+  cat("Genomic annotation is disabled. This keeps the synthetic fixture from being misrepresented as hg38 and avoids silently mixing genome builds. Enabling annotation requires the declared peak build to exactly match the annotation build and the selected TxDb metadata.\n")
+}
+```
+
+# Interpretation boundary
+
+The exported tables support review of differential peaks and transformed-count patterns. This compact workflow intentionally omits the original exploratory derivative networks, online enrichment, WikiPathways, Cytoscape examples, and cross-mark notebooks. Those sections require separate redesign, validated thresholds, and explicit reference provenance before they can be presented as a reusable analysis.
+
+```{r session-info}
+sessionInfo()
+```
