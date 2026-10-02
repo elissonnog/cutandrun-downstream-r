@@ -1,4 +1,5 @@
 output/
+data/
 report/*_files/
 .Rhistory
 .RData
