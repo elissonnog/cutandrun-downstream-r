@@ -13,7 +13,13 @@ params:
 knitr::opts_chunk$set(echo = FALSE, warning = TRUE, message = TRUE, fig.width = 8, fig.height = 5.5)
 source(file.path("R", "helpers.R"))
 config <- load_analysis_config(params$config_path)
-plot_label <- if (grepl("SYNTHETIC", config$data_label, ignore.case = TRUE)) "SYNTHETIC DEMO" else config$data_label
+plot_label <- if (!is.null(config$figure_label) && nzchar(config$figure_label)) {
+  config$figure_label
+} else if (grepl("SYNTHETIC", config$data_label, ignore.case = TRUE)) {
+  "SYNTHETIC DEMO"
+} else {
+  config$data_label
+}
 resolve_project_path <- function(path) {
   if (grepl("^/", path)) path else file.path(getwd(), path)
 }
@@ -53,6 +59,13 @@ run_metadata <- data.frame(
             config$min_total_count, config$fdr, nrow(inputs$counts), nrow(dds),
             ncol(inputs$counts), isTRUE(config$annotation$enabled))
 )
+if (!is.null(config$provenance)) {
+  provenance_rows <- data.frame(
+    field = paste0("provenance_", names(config$provenance)),
+    value = unlist(config$provenance, use.names = FALSE)
+  )
+  run_metadata <- rbind(run_metadata, provenance_rows)
+}
 write.csv(run_metadata, file.path(paths[["tables"]], "run_metadata.csv"), row.names = FALSE)
 knitr::kable(run_metadata)
 ```
@@ -86,7 +99,7 @@ pca_plot
 ```{r correlation}
 correlation_path <- file.path(paths[["figures"]], "sample_correlation.png")
 save_correlation_heatmap(transformed, correlation_path,
-  paste(plot_label, "sample correlation", sep = " - "))
+  paste(plot_label, "sample correlation", sep = " - "), metadata = metadata)
 knitr::include_graphics(correlation_path)
 ```
 
@@ -117,21 +130,28 @@ for (index in seq_len(nrow(contrasts))) {
   result_list[[label]] <- result
   write.csv(result, file.path(paths[["tables"]], paste0(stem, "_deseq2.csv")), row.names = FALSE)
 
+  ma_plot <- make_ma_plot(result, label, config$fdr, plot_label)
+  save_ggplot(ma_plot, file.path(paths[["figures"]], paste0(stem, "_ma.png")))
+  volcano <- make_volcano_plot(result, label, config$fdr, plot_label)
+  save_ggplot(volcano, file.path(paths[["figures"]], paste0(stem, "_volcano.png")))
+  heatmap_path <- file.path(paths[["figures"]], paste0(stem, "_significant_peak_heatmap.png"))
+  heatmap_info <- save_significant_peak_heatmap(
+    transformed, metadata, heatmap_path, result, config$fdr, config$heatmap_top_peaks,
+    paste(plot_label, label, "significant peak replicate heatmap", sep = " - ")
+  )
+
   summary_rows[[index]] <- data.frame(
     contrast = label,
     tested = sum(!is.na(result$pvalue)),
     significant = sum(result$significant, na.rm = TRUE),
     increased = sum(result$direction == "increased", na.rm = TRUE),
-    decreased = sum(result$direction == "decreased", na.rm = TRUE)
+    decreased = sum(result$direction == "decreased", na.rm = TRUE),
+    heatmap_peaks = heatmap_info$selected_n
   )
 
-  volcano <- make_volcano_plot(result, label, config$fdr, plot_label)
-  save_ggplot(volcano, file.path(paths[["figures"]], paste0(stem, "_volcano.png")))
-  heatmap_path <- file.path(paths[["figures"]], paste0(stem, "_top_peaks_heatmap.png"))
-  save_top_peak_heatmap(transformed, heatmap_path, result, config$heatmap_top_peaks,
-    paste(plot_label, label, "top differential peaks", sep = " - "))
-
   cat("\n## ", label, "\n\n", sep = "")
+  print(ma_plot)
+  cat("\n")
   print(volcano)
   cat("\n")
   print(knitr::include_graphics(heatmap_path))
