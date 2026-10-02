@@ -27,6 +27,15 @@ assert_true(all(fixture$counts >= 0 & fixture$counts == round(fixture$counts)), 
 assert_true(identical(safe_file_stem("treated vs reference"), "treated_vs_reference"),
             "Filename sanitization failed.")
 
+ranking_fixture <- data.frame(
+  peak_id = c("peak_b", "peak_a", "peak_c", "peak_d"),
+  padj = c(0.01, 0.01, 0.20, NA_real_),
+  log2FoldChange = c(1, -2, 8, 10)
+)
+ranked_significant <- rank_significant_peaks(ranking_fixture, fdr = 0.05, max_peaks = 30L)
+assert_true(identical(ranked_significant$peak_id, c("peak_a", "peak_b")),
+            "Significant-peak ranking is not deterministic or included non-significant peaks.")
+
 reordered <- metadata[rev(rownames(metadata)), , drop = FALSE]
 realigned <- validate_analysis_inputs(fixture$counts, reordered, contrasts, "~ batch + condition")
 assert_true(identical(colnames(fixture$counts), rownames(realigned)), "Metadata was not safely reordered.")
