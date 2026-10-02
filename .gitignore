@@ -1,0 +1,5 @@
+output/
+report/*_files/
+.Rhistory
+.RData
+.DS_Store
