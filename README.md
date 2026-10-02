@@ -27,9 +27,11 @@ The preparation script downloads the two author-supplied source files, verifies 
 
 Review the saved [HTML report](report/gse186608_h3k27ac_downstream.html), [contrast summary](results/gse186608/contrast_summary.csv), and [top significant-region snapshot](results/gse186608/top_significant_regions.csv). The workflow requires R, Pandoc, `rmarkdown`, `knitr`, `ggplot2`, `openssl`, `DESeq2`, `SummarizedExperiment`, and the hg38 Bioconductor annotation packages named in the configuration.
 
+Dependency checks, tested package versions, tests, and result-regeneration commands are documented in [SETUP_AND_TESTING.md](SETUP_AND_TESTING.md).
+
 ## Results
 
-All 38,649 input regions are retained in exported tables; 31,730 nonzero regions receive a test statistic. At FDR 0.05:
+All 38,649 input regions are retained in exported result ledgers. Of these, 6,919 are all-zero and 31,730 receive a finite raw p-value; DESeq2 independent filtering leaves 26,257 finite adjusted p-values for cobimetinib and 24,433 for TNFalpha. At FDR 0.05:
 
 - Cobimetinib versus untreated: 2,743 significant regions (1,084 increased; 1,659 decreased).
 - TNFalpha versus untreated: 914 significant regions (802 increased; 112 decreased).

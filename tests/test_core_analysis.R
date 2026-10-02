@@ -20,7 +20,8 @@ dds <- prepare_deseq_dataset(
   config$normalization, project_root = getwd()
 )
 dds <- fit_deseq_model(dds)
-result <- run_deseq_contrast(dds, contrasts[1L, , drop = FALSE], config$fdr)
+result <- run_deseq_contrast(dds, contrasts[1L, , drop = FALSE], config$fdr,
+                             input_counts = fixture$counts)
 
 assert_true(nrow(result) == 800L, "Integration result lost synthetic peaks.")
 assert_true(all(is.finite(DESeq2::sizeFactors(dds)) & DESeq2::sizeFactors(dds) > 0),
@@ -33,6 +34,15 @@ assert_true(stats::median(result$log2FoldChange[match(sprintf("SyntheticPeak%04d
 assert_true(stats::median(result$log2FoldChange[match(sprintf("SyntheticPeak%04d", 81:160), result$peak_id)],
                           na.rm = TRUE) < -1,
             "Planted decreased peaks do not have the expected effect direction.")
+assert_true(all(result$test_status %in% c(
+  "all_zero", "low_count_filtered", "unavailable", "independent_filtered",
+  "tested_nonsignificant", "significant"
+)), "Unexpected result status.")
+assert_true(all(is.na(result$significant[result$test_status %in% c(
+  "all_zero", "low_count_filtered", "unavailable", "independent_filtered"
+)])), "Untested or independently filtered peaks must have significant = NA.")
+assert_true(all(!result$significant[result$test_status == "tested_nonsignificant"]),
+            "Tested nonsignificant peaks must have significant = FALSE.")
 
 provided <- seq(0.75, 1.45, length.out = ncol(fixture$counts))
 factor_path <- tempfile(fileext = ".csv")

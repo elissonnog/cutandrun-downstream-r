@@ -1,3 +1,3 @@
-"contrast","tested","significant","increased","decreased","heatmap_peaks"
-"cobimetinib_vs_untreated",31730,2743,1084,1659,30
-"TNFalpha_vs_untreated",31730,914,802,112,30
+"contrast","input_rows","retained_rows","finite_pvalue","finite_padj","significant","increased","decreased","all_zero","low_count_filtered","unavailable","independent_filtered","tested_nonsignificant","alpha","p_adjust_method","independent_filtering","filter_threshold","bh_scope"
+"cobimetinib_vs_untreated",38649,38649,31730,26257,2743,1084,1659,6919,0,0,5473,23514,0.05,"BH",TRUE,17.2989977832028,"one DESeq2 contrast among retained rows passing the selected independent-filter threshold with finite raw p-values"
+"TNFalpha_vs_untreated",38649,38649,31730,24433,914,802,112,6919,0,0,7297,23519,0.05,"BH",TRUE,22.5206535619465,"one DESeq2 contrast among retained rows passing the selected independent-filter threshold with finite raw p-values"

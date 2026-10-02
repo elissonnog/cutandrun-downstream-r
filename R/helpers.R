@@ -1,5 +1,5 @@
 required_core_packages <- function() {
-  c("rmarkdown", "knitr", "DESeq2", "SummarizedExperiment", "ggplot2")
+  c("rmarkdown", "knitr", "DESeq2", "SummarizedExperiment", "ggplot2", "openssl")
 }
 
 required_annotation_packages <- function(config = NULL) {
@@ -122,7 +122,7 @@ read_and_validate_csv_header <- function(path, input_name) {
   invisible(header)
 }
 
-read_peak_counts <- function(path, coordinate_system) {
+read_peak_counts <- function(path, coordinate_system, sample_ids = NULL) {
   if (!file.exists(path)) stop("Peak-count matrix not found: ", path)
   if (!coordinate_system %in% c("one_based_closed", "bed_zero_based_half_open")) {
     stop("Unsupported coordinate system: ", coordinate_system)
@@ -134,7 +134,19 @@ read_peak_counts <- function(path, coordinate_system) {
   if (length(missing)) {
     stop("Peak-count matrix missing required columns: ", paste(missing, collapse = ", "))
   }
-  sample_columns <- setdiff(names(tab), coordinate_columns)
+  sample_columns <- if (is.null(sample_ids)) setdiff(names(tab), coordinate_columns) else sample_ids
+  if (!is.null(sample_ids)) {
+    missing_samples <- setdiff(sample_ids, names(tab))
+    extra_columns <- setdiff(names(tab), c(coordinate_columns, sample_ids))
+    if (length(missing_samples)) {
+      stop("Peak-count matrix is missing metadata-declared sample columns: ",
+           paste(missing_samples, collapse = ", "))
+    }
+    if (length(extra_columns)) {
+      stop("Peak-count matrix contains unexpected columns outside coordinates and metadata sample IDs: ",
+           paste(extra_columns, collapse = ", "))
+    }
+  }
   if (length(sample_columns) < 2L) stop("Peak-count matrix must contain at least two sample columns.")
   if (anyNA(tab$peak_id) || any(trimws(tab$peak_id) == "") || anyDuplicated(tab$peak_id)) {
     stop("`peak_id` values must be non-blank and unique.")
@@ -255,6 +267,10 @@ validate_analysis_inputs <- function(counts, metadata, contrasts, design) {
     stop("Design variables must be categorical for this workflow: ", paste(non_categorical, collapse = ", "))
   }
   for (column in design_variables) {
+    values <- unique(as.character(metadata[[column]]))
+    if (length(values) && all(grepl("^[+-]?[0-9.]+$", values))) {
+      stop("Design variables encoded only as numeric-looking values are rejected; use explicit categorical labels: ", column)
+    }
     metadata[[column]] <- factor(metadata[[column]])
     if (nlevels(metadata[[column]]) < 2L) stop("Design variable must contain at least two levels: ", column)
   }
@@ -320,20 +336,110 @@ transform_for_visualization <- function(dds) {
   DESeq2::varianceStabilizingTransformation(dds, blind = FALSE)
 }
 
-run_deseq_contrast <- function(dds, contrast_row, fdr) {
+classify_result_status <- function(input_row_sums, retained, pvalue, padj, significant) {
+  status <- rep("unavailable", length(input_row_sums))
+  status[input_row_sums == 0] <- "all_zero"
+  status[input_row_sums > 0 & !retained] <- "low_count_filtered"
+  status[retained & is.finite(pvalue) & !is.finite(padj)] <- "independent_filtered"
+  status[retained & is.finite(padj) & !significant] <- "tested_nonsignificant"
+  status[retained & is.finite(padj) & significant] <- "significant"
+  status
+}
+
+complete_result_ledger <- function(result_table, input_counts, id_column,
+                                   increase_label, decrease_label) {
+  input_ids <- rownames(input_counts)
+  ledger <- data.frame(
+    id = input_ids,
+    input_total_count = rowSums(input_counts),
+    stringsAsFactors = FALSE
+  )
+  names(ledger)[1L] <- id_column
+  result_table$retained_for_model <- TRUE
+  ledger <- merge(ledger, result_table, by = id_column, all.x = TRUE, sort = FALSE)
+  ledger <- ledger[match(input_ids, ledger[[id_column]]), , drop = FALSE]
+  retained <- !is.na(ledger$retained_for_model)
+  significant <- retained & is.finite(ledger$padj) & ledger$padj < attr(result_table, "fdr")
+  ledger$test_status <- classify_result_status(
+    ledger$input_total_count, retained, ledger$pvalue, ledger$padj, significant
+  )
+  ledger$significant <- ifelse(
+    ledger$test_status %in% c("significant", "tested_nonsignificant"),
+    ledger$test_status == "significant", NA
+  )
+  ledger$direction <- NA_character_
+  ledger$direction[ledger$test_status == "significant" & ledger$log2FoldChange > 0] <- increase_label
+  ledger$direction[ledger$test_status == "significant" & ledger$log2FoldChange < 0] <- decrease_label
+  ledger$retained_for_model <- retained
+  ledger
+}
+
+run_deseq_contrast <- function(dds, contrast_row, fdr, input_counts = NULL) {
   result <- DESeq2::results(
     dds,
     contrast = c(contrast_row$factor, contrast_row$numerator, contrast_row$denominator),
-    alpha = fdr
+    alpha = fdr,
+    independentFiltering = TRUE
   )
   tab <- as.data.frame(result)
   tab$peak_id <- rownames(tab)
-  tab$significant <- !is.na(tab$padj) & tab$padj < fdr
-  tab$direction <- ifelse(tab$significant & tab$log2FoldChange > 0, "increased",
-                          ifelse(tab$significant & tab$log2FoldChange < 0,
-                                 "decreased", "not_significant"))
-  tab[, c("peak_id", "baseMean", "log2FoldChange", "lfcSE", "stat", "pvalue",
-          "padj", "significant", "direction")]
+  attr(tab, "fdr") <- fdr
+  settings <- list(
+    alpha = fdr,
+    p_adjust_method = "BH",
+    independent_filtering = TRUE,
+    filter_threshold = unname(S4Vectors::metadata(result)$filterThreshold %||% NA_real_),
+    bh_scope = "one DESeq2 contrast among retained rows passing the selected independent-filter threshold with finite raw p-values"
+  )
+  if (is.null(input_counts)) {
+    tab$input_total_count <- NA_real_
+    tab$retained_for_model <- TRUE
+    tab$test_status <- classify_result_status(
+      rep(1, nrow(tab)), rep(TRUE, nrow(tab)), tab$pvalue, tab$padj,
+      is.finite(tab$padj) & tab$padj < fdr
+    )
+    tab$significant <- ifelse(
+      tab$test_status %in% c("significant", "tested_nonsignificant"),
+      tab$test_status == "significant", NA
+    )
+    tab$direction <- NA_character_
+    tab$direction[tab$test_status == "significant" & tab$log2FoldChange > 0] <- "increased"
+    tab$direction[tab$test_status == "significant" & tab$log2FoldChange < 0] <- "decreased"
+  } else {
+    tab <- complete_result_ledger(tab, input_counts, "peak_id", "increased", "decreased")
+  }
+  tab <- tab[, c("peak_id", "input_total_count", "retained_for_model", "baseMean",
+                 "log2FoldChange", "lfcSE", "stat", "pvalue", "padj", "test_status",
+                 "significant", "direction")]
+  attr(tab, "results_settings") <- settings
+  tab
+}
+
+`%||%` <- function(x, y) if (is.null(x) || !length(x)) y else x
+
+summarize_contrast_result <- function(result_table, contrast_label) {
+  settings <- attr(result_table, "results_settings")
+  data.frame(
+    contrast = contrast_label,
+    input_rows = nrow(result_table),
+    retained_rows = sum(result_table$retained_for_model),
+    finite_pvalue = sum(is.finite(result_table$pvalue)),
+    finite_padj = sum(is.finite(result_table$padj)),
+    significant = sum(result_table$test_status == "significant"),
+    increased = sum(result_table$direction == "increased", na.rm = TRUE),
+    decreased = sum(result_table$direction == "decreased", na.rm = TRUE),
+    all_zero = sum(result_table$test_status == "all_zero"),
+    low_count_filtered = sum(result_table$test_status == "low_count_filtered"),
+    unavailable = sum(result_table$test_status == "unavailable"),
+    independent_filtered = sum(result_table$test_status == "independent_filtered"),
+    tested_nonsignificant = sum(result_table$test_status == "tested_nonsignificant"),
+    alpha = settings$alpha,
+    p_adjust_method = settings$p_adjust_method,
+    independent_filtering = settings$independent_filtering,
+    filter_threshold = settings$filter_threshold,
+    bh_scope = settings$bh_scope,
+    stringsAsFactors = FALSE
+  )
 }
 
 make_pca_plot <- function(transformed, metadata, top_peaks = 500L, plot_title = "Peak-count PCA") {
@@ -380,11 +486,14 @@ make_library_qc_plot <- function(counts, metadata, plot_title = "Peak-count libr
 make_volcano_plot <- function(result_table, label, fdr, data_label = NULL) {
   plot_data <- result_table
   plot_data$minus_log10_padj <- -log10(pmax(plot_data$padj, .Machine$double.xmin))
+  plot_data$result_class <- ifelse(plot_data$test_status == "significant", plot_data$direction,
+                                   plot_data$test_status)
   ggplot2::ggplot(plot_data, ggplot2::aes(x = log2FoldChange, y = minus_log10_padj,
-                                         color = direction)) +
+                                         color = result_class)) +
     ggplot2::geom_point(alpha = 0.7, size = 1.5, na.rm = TRUE) +
     ggplot2::scale_color_manual(values = c(increased = "#B2182B", decreased = "#2166AC",
-                                           not_significant = "#BDBDBD")) +
+      tested_nonsignificant = "#BDBDBD", independent_filtered = "#7F7F7F",
+      unavailable = "#4D4D4D"), na.value = "#4D4D4D") +
     ggplot2::geom_hline(yintercept = -log10(fdr), linetype = "dashed", linewidth = 0.4) +
     ggplot2::labs(title = if (is.null(data_label)) label else paste(data_label, label, sep = ": "),
                   x = "log2 fold change", y = "-log10 adjusted p-value", color = NULL) +
@@ -392,12 +501,16 @@ make_volcano_plot <- function(result_table, label, fdr, data_label = NULL) {
 }
 
 make_ma_plot <- function(result_table, label, fdr, data_label = NULL) {
-  plot_data <- result_table[result_table$baseMean > 0 & is.finite(result_table$log2FoldChange), ]
-  ggplot2::ggplot(plot_data, ggplot2::aes(x = baseMean, y = log2FoldChange, color = direction)) +
+  plot_data <- result_table[is.finite(result_table$baseMean) & result_table$baseMean > 0 &
+                              is.finite(result_table$log2FoldChange), ]
+  plot_data$result_class <- ifelse(plot_data$test_status == "significant", plot_data$direction,
+                                   plot_data$test_status)
+  ggplot2::ggplot(plot_data, ggplot2::aes(x = baseMean, y = log2FoldChange, color = result_class)) +
     ggplot2::geom_point(alpha = 0.65, size = 1.2, na.rm = TRUE) +
     ggplot2::scale_x_log10() +
     ggplot2::scale_color_manual(values = c(increased = "#B2182B", decreased = "#2166AC",
-                                           not_significant = "#BDBDBD")) +
+      tested_nonsignificant = "#BDBDBD", independent_filtered = "#7F7F7F",
+      unavailable = "#4D4D4D"), na.value = "#4D4D4D") +
     ggplot2::geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.4) +
     ggplot2::labs(
       title = if (is.null(data_label)) label else paste(data_label, label, sep = ": "),
@@ -412,6 +525,43 @@ save_ggplot <- function(plot, path, width = 7, height = 5) {
   invisible(path)
 }
 
+save_dispersion_plot <- function(dds, path, plot_title = "DESeq2 dispersion estimates") {
+  grDevices::png(path, width = 1200, height = 900, res = 150)
+  on.exit(grDevices::dev.off(), add = TRUE)
+  DESeq2::plotDispEsts(dds, main = plot_title)
+  invisible(path)
+}
+
+sha256_file <- function(path) {
+  if (!file.exists(path)) return(NA_character_)
+  as.character(openssl::sha256(file(path)))
+}
+
+input_manifest <- function(paths) {
+  data.frame(
+    input = names(paths), path = normalizePath(unname(paths), mustWork = TRUE),
+    sha256 = vapply(unname(paths), sha256_file, character(1)), stringsAsFactors = FALSE
+  )
+}
+
+software_versions <- function(packages) {
+  data.frame(
+    software = c("R", packages, "Pandoc"),
+    version = c(
+      paste(R.version$major, R.version$minor, sep = "."),
+      vapply(packages, function(package) {
+        if (requireNamespace(package, quietly = TRUE)) as.character(utils::packageVersion(package)) else NA_character_
+      }, character(1)),
+      if (is_pandoc_available()) as.character(rmarkdown::pandoc_version()) else NA_character_
+    ), stringsAsFactors = FALSE
+  )
+}
+
+code_manifest <- function(paths) {
+  data.frame(file = unname(paths), sha256 = vapply(paths, sha256_file, character(1)),
+             stringsAsFactors = FALSE)
+}
+
 save_correlation_heatmap <- function(transformed, path, plot_title = "Sample correlation", metadata = NULL) {
   correlation <- stats::cor(SummarizedExperiment::assay(transformed), method = "pearson")
   if (!is.null(metadata) && "plot_label" %in% names(metadata)) {
@@ -419,10 +569,20 @@ save_correlation_heatmap <- function(transformed, path, plot_title = "Sample cor
     colnames(correlation) <- labels
     rownames(correlation) <- labels
   }
-  grDevices::png(path, width = 1400, height = 1200, res = 160)
-  on.exit(grDevices::dev.off(), add = TRUE)
-  stats::heatmap(correlation, symm = TRUE, margins = c(9, 9), main = plot_title)
-  invisible(path)
+  plot_data <- as.data.frame(as.table(correlation), stringsAsFactors = FALSE)
+  names(plot_data) <- c("sample_x", "sample_y", "pearson_correlation")
+  plot_data$sample_x <- factor(plot_data$sample_x, levels = colnames(correlation))
+  plot_data$sample_y <- factor(plot_data$sample_y, levels = rev(rownames(correlation)))
+  plot <- ggplot2::ggplot(plot_data, ggplot2::aes(sample_x, sample_y, fill = pearson_correlation)) +
+    ggplot2::geom_tile() +
+    ggplot2::geom_text(ggplot2::aes(label = sprintf("%.3f", pearson_correlation)), size = 3) +
+    ggplot2::scale_fill_gradient(low = "#F7FBFF", high = "#08519C", limits = c(-1, 1)) +
+    ggplot2::labs(title = plot_title, x = NULL, y = NULL, fill = "Pearson r") +
+    ggplot2::theme_minimal(base_size = 10) +
+    ggplot2::theme(panel.grid = ggplot2::element_blank(),
+                   axis.text.x = ggplot2::element_text(angle = 45, hjust = 1))
+  save_ggplot(plot, path, width = 7, height = 6)
+  invisible(correlation)
 }
 
 rank_significant_peaks <- function(result_table, fdr, max_peaks) {

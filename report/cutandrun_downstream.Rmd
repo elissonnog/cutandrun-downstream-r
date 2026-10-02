@@ -7,180 +7,226 @@ output:
     df_print: paged
 params:
   config_path: null
+  portfolio_snapshot: false
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = FALSE, warning = TRUE, message = TRUE, fig.width = 8, fig.height = 5.5)
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, fig.width = 8, fig.height = 5.5)
 source(file.path("R", "helpers.R"))
+resolve_project_path <- function(path) if (grepl("^/", path)) path else file.path(getwd(), path)
 config <- load_analysis_config(params$config_path)
-plot_label <- if (!is.null(config$figure_label) && nzchar(config$figure_label)) {
-  config$figure_label
-} else if (grepl("SYNTHETIC", config$data_label, ignore.case = TRUE)) {
-  "SYNTHETIC DEMO"
-} else {
-  config$data_label
-}
-resolve_project_path <- function(path) {
-  if (grepl("^/", path)) path else file.path(getwd(), path)
-}
-inputs <- read_peak_counts(resolve_project_path(config$counts_path), config$coordinate_system)
-metadata <- read_sample_metadata(resolve_project_path(config$metadata_path))
-contrasts <- read_contrasts(resolve_project_path(config$contrasts_path))
-metadata <- validate_analysis_inputs(inputs$counts, metadata, contrasts, config$design)
+plot_label <- if (!is.null(config$figure_label) && nzchar(config$figure_label)) config$figure_label else config$data_label
 paths <- prepare_output_directories(resolve_project_path(config$output_dir))
+warning_log <- character()
+capture_warnings <- function(expr) withCallingHandlers(expr, warning = function(w) {
+  warning_log <<- c(warning_log, conditionMessage(w)); invokeRestart("muffleWarning")
+})
+
+counts_path <- resolve_project_path(config$counts_path)
+metadata_path <- resolve_project_path(config$metadata_path)
+contrasts_path <- resolve_project_path(config$contrasts_path)
+sample_metadata <- read_sample_metadata(metadata_path)
+inputs <- read_peak_counts(counts_path, config$coordinate_system, sample_ids = rownames(sample_metadata))
+contrasts <- read_contrasts(contrasts_path)
+sample_metadata <- validate_analysis_inputs(inputs$counts, sample_metadata, contrasts, config$design)
+
 peak_reference <- inputs$peaks
+annotation_coverage <- NULL
 if (isTRUE(config$annotation$enabled)) {
-  peak_reference <- annotate_peaks_optional(inputs$peaks, config)
+  peak_reference <- capture_warnings(annotate_peaks_optional(inputs$peaks, config))
   write.csv(peak_reference, file.path(paths[["tables"]], "peak_annotation.csv"), row.names = FALSE)
+  annotation_coverage <- data.frame(
+    input_peaks = nrow(peak_reference),
+    annotated_category = sum(!is.na(peak_reference$annotation) & nzchar(peak_reference$annotation)),
+    gene_id_assigned = sum(!is.na(peak_reference$geneId) & nzchar(as.character(peak_reference$geneId))),
+    symbol_assigned = sum(!is.na(peak_reference$SYMBOL) & nzchar(as.character(peak_reference$SYMBOL))),
+    distance_to_tss_available = sum(is.finite(peak_reference$distanceToTSS)),
+    stringsAsFactors = FALSE
+  )
+  write.csv(annotation_coverage, file.path(paths[["tables"]], "annotation_coverage.csv"), row.names = FALSE)
 }
+
 dds <- prepare_deseq_dataset(
-  inputs$counts, metadata, config$design, config$min_total_count,
+  inputs$counts, sample_metadata, config$design, config$min_total_count,
   config$normalization, project_root = getwd()
 )
-dds <- fit_deseq_model(dds)
-transformed <- transform_for_visualization(dds)
-```
+dds <- capture_warnings(fit_deseq_model(dds))
+transformed <- capture_warnings(transform_for_visualization(dds))
 
-# Scope and identity
-
-**`r config$project_title`**
-
-**Data status:** `r config$data_label`
-
-This downstream report starts from an explicit consensus-peak-by-sample integer count matrix. It does not call peaks, count BAM files, reproduce upstream alignment QC, or run DiffBind. Peak coordinates remain stable identifiers throughout the analysis.
-
-```{r run-metadata}
-run_metadata <- data.frame(
-  field = c("data_label", "genome_build", "input_coordinate_system", "analysis_coordinate_system",
-            "design", "normalization", "minimum_total_count", "fdr",
-            "input_peaks", "retained_peaks", "samples", "annotation_enabled"),
-  value = c(config$data_label, config$genome_build, config$coordinate_system,
-            "one_based_closed", config$design, config$normalization$method,
-            config$min_total_count, config$fdr, nrow(inputs$counts), nrow(dds),
-            ncol(inputs$counts), isTRUE(config$annotation$enabled))
-)
-if (!is.null(config$provenance)) {
-  provenance_rows <- data.frame(
-    field = paste0("provenance_", names(config$provenance)),
-    value = unlist(config$provenance, use.names = FALSE)
-  )
-  run_metadata <- rbind(run_metadata, provenance_rows)
-}
-write.csv(run_metadata, file.path(paths[["tables"]], "run_metadata.csv"), row.names = FALSE)
-knitr::kable(run_metadata)
-```
-
-# Normalization limitation
-
-```{r normalization-note, results='asis'}
-if (identical(config$normalization$method, "deseq2_median_ratio")) {
-  cat("DESeq2 median-of-ratios normalization is used here. It estimates **relative** occupancy under the assumption that most retained peaks do not shift together. A widespread CUT&RUN occupancy change can violate that assumption, so this run alone cannot establish a global gain or loss of signal. If validated spike-in or other external scaling factors are available, rerun with `provided_deseq2_size_factors` and document how those factors were derived.\n")
-} else {
-  cat("Externally supplied `deseq2_size_factor` divisors are used: normalized count = count / factor. A multiplicative spike-in scaling convention must therefore be inverted before use here, with its provenance documented. This report validates values, sample matching, and assignment order but cannot validate the experimental control or biological assumptions.\n")
-}
-```
-
-# Sample QC
-
-```{r library-qc}
-library_qc <- make_library_qc_plot(inputs$counts, metadata,
-  paste(plot_label, "library depth and detected peaks", sep = " - "))
-save_ggplot(library_qc, file.path(paths[["figures"]], "library_qc.png"))
-library_qc
-```
-
-```{r pca}
-pca_plot <- make_pca_plot(transformed, metadata, config$pca_top_peaks,
-  paste(plot_label, "variance-stabilized peak-count PCA", sep = " - "))
-save_ggplot(pca_plot, file.path(paths[["figures"]], "pca.png"))
-pca_plot
-```
-
-```{r correlation}
-correlation_path <- file.path(paths[["figures"]], "sample_correlation.png")
-save_correlation_heatmap(transformed, correlation_path,
-  paste(plot_label, "sample correlation", sep = " - "), metadata = metadata)
-knitr::include_graphics(correlation_path)
-```
-
-```{r normalized-counts}
 normalized <- as.data.frame(DESeq2::counts(dds, normalized = TRUE), check.names = FALSE)
 normalized$peak_id <- rownames(normalized)
 normalized <- merge(inputs$peaks, normalized, by = "peak_id", sort = FALSE)
+normalized <- normalized[match(inputs$peaks$peak_id, normalized$peak_id), ]
 write.csv(normalized, file.path(paths[["tables"]], "normalized_peak_counts.csv"), row.names = FALSE)
 size_factor_table <- data.frame(sample_id = colnames(dds), deseq2_size_factor = DESeq2::sizeFactors(dds))
 write.csv(size_factor_table, file.path(paths[["tables"]], "size_factors.csv"), row.names = FALSE)
-knitr::kable(size_factor_table, digits = 4, caption = "Size factors used in the fitted model")
-```
 
-# Differential peaks
-
-```{r differential, results='asis'}
-result_list <- vector("list", nrow(contrasts))
-names(result_list) <- contrasts$label
+result_list <- list()
 summary_rows <- vector("list", nrow(contrasts))
-
 for (index in seq_len(nrow(contrasts))) {
   contrast <- contrasts[index, , drop = FALSE]
   label <- contrast$label[[1L]]
-  stem <- safe_file_stem(label)
-  result <- run_deseq_contrast(dds, contrast, config$fdr)
-  result <- merge(peak_reference, result, by = "peak_id", sort = FALSE)
-  result <- result[order(result$padj, -abs(result$log2FoldChange), na.last = TRUE), ]
+  ledger <- capture_warnings(run_deseq_contrast(dds, contrast, config$fdr, input_counts = inputs$counts))
+  summary_rows[[index]] <- summarize_contrast_result(ledger, label)
+  result <- merge(peak_reference, ledger, by = "peak_id", sort = FALSE)
+  result <- result[match(inputs$peaks$peak_id, result$peak_id), ]
   result_list[[label]] <- result
-  write.csv(result, file.path(paths[["tables"]], paste0(stem, "_deseq2.csv")), row.names = FALSE)
-
-  ma_plot <- make_ma_plot(result, label, config$fdr, plot_label)
-  save_ggplot(ma_plot, file.path(paths[["figures"]], paste0(stem, "_ma.png")))
-  volcano <- make_volcano_plot(result, label, config$fdr, plot_label)
-  save_ggplot(volcano, file.path(paths[["figures"]], paste0(stem, "_volcano.png")))
-  heatmap_path <- file.path(paths[["figures"]], paste0(stem, "_significant_peak_heatmap.png"))
-  heatmap_info <- save_significant_peak_heatmap(
-    transformed, metadata, heatmap_path, result, config$fdr, config$heatmap_top_peaks,
-    paste(plot_label, label, "significant peak replicate heatmap", sep = " - ")
-  )
-
-  summary_rows[[index]] <- data.frame(
-    contrast = label,
-    tested = sum(!is.na(result$pvalue)),
-    significant = sum(result$significant, na.rm = TRUE),
-    increased = sum(result$direction == "increased", na.rm = TRUE),
-    decreased = sum(result$direction == "decreased", na.rm = TRUE),
-    heatmap_peaks = heatmap_info$selected_n
-  )
-
-  cat("\n## ", label, "\n\n", sep = "")
-  print(ma_plot)
-  cat("\n")
-  print(volcano)
-  cat("\n")
-  print(knitr::include_graphics(heatmap_path))
-  cat("\n")
+  write.csv(result, file.path(paths[["tables"]], paste0(safe_file_stem(label), "_deseq2.csv")), row.names = FALSE)
 }
-
 result_summary <- do.call(rbind, summary_rows)
 write.csv(result_summary, file.path(paths[["tables"]], "contrast_summary.csv"), row.names = FALSE)
+
+input_files <- c(counts = counts_path, metadata = metadata_path, contrasts = contrasts_path,
+                 config = params$config_path)
+if (identical(config$normalization$method, "provided_deseq2_size_factors")) {
+  input_files <- c(input_files, size_factors = resolve_project_path(config$normalization$size_factors_path))
+}
+write.csv(input_manifest(input_files), file.path(paths[["tables"]], "input_manifest.csv"), row.names = FALSE)
+write.csv(software_versions(unique(c(required_core_packages(),
+  if (isTRUE(config$annotation$enabled)) required_annotation_packages(config) else character()))),
+  file.path(paths[["tables"]], "software_versions.csv"), row.names = FALSE)
+write.csv(code_manifest(c("R/helpers.R", "report/cutandrun_downstream.Rmd", "run_analysis.R")),
+          file.path(paths[["tables"]], "code_manifest.csv"), row.names = FALSE)
+writeLines(capture.output(dput(config)), file.path(paths[["tables"]], "resolved_config.txt"))
+run_metadata <- data.frame(
+  field = c("project", "data_status", "genome_build", "input_coordinate_system",
+            "analysis_coordinate_system", "design", "normalization", "minimum_total_count",
+            "fdr", "input_peaks", "retained_peaks", "samples", "annotation_enabled", "generated_utc"),
+  value = c(config$project_title, config$data_label, config$genome_build, config$coordinate_system,
+            "one_based_closed", config$design, config$normalization$method, config$min_total_count,
+            config$fdr, nrow(inputs$counts), nrow(dds), ncol(inputs$counts),
+            isTRUE(config$annotation$enabled), format(Sys.time(), tz = "UTC", usetz = TRUE)),
+  stringsAsFactors = FALSE
+)
+if (!is.null(config$provenance)) {
+  run_metadata <- rbind(run_metadata, data.frame(
+    field = paste0("provenance_", names(config$provenance)),
+    value = unlist(config$provenance, use.names = FALSE), stringsAsFactors = FALSE
+  ))
+}
+write.csv(run_metadata, file.path(paths[["tables"]], "run_metadata.csv"), row.names = FALSE)
 ```
 
-```{r result-summary}
-knitr::kable(result_summary, caption = "Differential peak summary")
+# Analysis summary
+
+**`r config$project_title`**  
+**Data status:** `r config$data_label`
+
+This report starts from an explicit consensus-peak-by-sample integer count matrix. It does not call peaks, count BAM files, reproduce alignment QC, or run DiffBind.
+
+```{r headline-summary}
+knitr::kable(result_summary, digits = 4, caption = "Contrast-level result ledger summary")
 ```
 
-# Optional genomic annotation
+Every input region remains in each result export. Missing adjusted p-values are not called non-significant: all_zero, low_count_filtered, unavailable, and independent_filtered are explicit. Benjamini-Hochberg adjustment and DESeq2 independent filtering are performed separately for each contrast.
+
+# Inputs, model, and normalization boundary
+
+```{r inputs}
+knitr::kable(run_metadata, caption = "Resolved run metadata")
+knitr::kable(sample_metadata, caption = "Sample metadata")
+knitr::kable(contrasts, caption = "Declared comparisons")
+knitr::kable(size_factor_table, digits = 4, caption = "Size factors used in the fitted model")
+```
+
+Only the coordinate columns plus sample IDs declared in metadata are accepted from the count matrix; unexpected columns cause an error rather than silently becoming count columns. Root-relative paths are resolved from the repository root. Numeric-only categorical codes are rejected.
+
+```{r normalization-note, results='asis'}
+if (identical(config$normalization$method, "deseq2_median_ratio")) {
+  cat("DESeq2 median-of-ratios normalization estimates **relative** occupancy and assumes most retained peaks do not shift together. Without spike-in or another external scale, this analysis cannot establish a global gain or loss of signal.\n")
+} else {
+  cat("Externally supplied DESeq2 size-factor divisors are used. Their experimental validity remains the analyst's responsibility.\n")
+}
+```
+
+# Sample diagnostics
+
+```{r diagnostics}
+library_qc <- make_library_qc_plot(inputs$counts, sample_metadata,
+  paste(plot_label, "library depth and detected peaks", sep = " - "))
+save_ggplot(library_qc, file.path(paths[["figures"]], "library_qc.png"))
+library_qc
+pca_plot <- make_pca_plot(transformed, sample_metadata, config$pca_top_peaks,
+  paste(plot_label, "variance-stabilized peak-count PCA", sep = " - "))
+save_ggplot(pca_plot, file.path(paths[["figures"]], "pca.png"))
+pca_plot
+correlation_path <- file.path(paths[["figures"]], "sample_correlation.png")
+correlation <- save_correlation_heatmap(transformed, correlation_path,
+  paste(plot_label, "sample correlation", sep = " - "), metadata = sample_metadata)
+write.csv(correlation, file.path(paths[["tables"]], "sample_correlation.csv"))
+knitr::include_graphics(normalizePath(correlation_path))
+dispersion_path <- file.path(paths[["figures"]], "dispersion_estimates.png")
+save_dispersion_plot(dds, dispersion_path, paste(plot_label, "dispersion estimates", sep = " - "))
+knitr::include_graphics(normalizePath(dispersion_path))
+```
+
+No samples are excluded automatically from these diagnostics. In the public example each condition has only two biological replicates; the separated untreated pair is retained as observed. With n=2 per condition, sample-level influence judgments are fragile, and standard Cook's-distance replacement is not available as it is for larger replicate groups.
+
+# Differential peaks
+
+Heatmaps select the lowest adjusted p-values, then largest absolute fold changes, then peak ID. They display row-centered VST counts for the selected significant regions; samples remain in input order.
+
+```{r differential, results='asis'}
+for (label in names(result_list)) {
+  result <- result_list[[label]]
+  stem <- safe_file_stem(label)
+  cat("\n## ", label, "\n\n", sep = "")
+  print(knitr::kable(result_summary[result_summary$contrast == label, ], digits = 4))
+  ma_plot <- make_ma_plot(result, label, config$fdr, plot_label)
+  save_ggplot(ma_plot, file.path(paths[["figures"]], paste0(stem, "_ma.png")))
+  print(ma_plot)
+  volcano <- make_volcano_plot(result, label, config$fdr, plot_label)
+  save_ggplot(volcano, file.path(paths[["figures"]], paste0(stem, "_volcano.png")))
+  print(volcano)
+  heatmap_path <- file.path(paths[["figures"]], paste0(stem, "_significant_peak_heatmap.png"))
+  heatmap_info <- save_significant_peak_heatmap(
+    transformed, sample_metadata, heatmap_path, result, config$fdr, config$heatmap_top_peaks,
+    paste(plot_label, label, "significant peak replicate heatmap", sep = " - ")
+  )
+  cat("\nThe heatmap shows ", heatmap_info$selected_n, " of ",
+      heatmap_info$significant_n, " significant regions.\n\n", sep = "")
+  print(knitr::include_graphics(normalizePath(heatmap_path)))
+}
+```
+
+# Genomic annotation
 
 ```{r annotation, results='asis'}
 if (isTRUE(config$annotation$enabled)) {
-  cat("Annotation completed with `", config$annotation$txdb_package,
-      "` and `", config$annotation$orgdb_package,
-      "`. Build and seqname compatibility were checked before annotation; annotation columns are included in each contrast result.\n", sep = "")
+  print(knitr::kable(annotation_coverage, caption = "Annotation coverage"))
+  cat("\nAnnotation used ", config$annotation$txdb_package, " and ",
+      config$annotation$orgdb_package, ". Genome build and seqnames were validated. ",
+      "Each contrast export includes annotation category, nearest gene fields, and distanceToTSS.\n", sep = "")
 } else {
-  cat("Genomic annotation is disabled. This keeps the synthetic fixture from being misrepresented as hg38 and avoids silently mixing genome builds. Enabling annotation requires the declared peak build to exactly match the annotation build and the selected TxDb metadata.\n")
+  cat("Annotation is disabled. This prevents synthetic coordinates from being presented as a reference genome.\n")
 }
 ```
 
 # Interpretation boundary
 
-The exported tables support review of differential peaks and transformed-count patterns. This compact workflow intentionally omits the original exploratory derivative networks, online enrichment, WikiPathways, Cytoscape examples, and cross-mark notebooks. Those sections require separate redesign, validated thresholds, and explicit reference provenance before they can be presented as a reusable analysis.
+The exported tables support review of relative differential peaks, annotation, and replicate patterns. The workflow intentionally omits exploratory derivative networks, online enrichment, WikiPathways, Cytoscape examples, cross-mark analyses, and repeat-family/LTR10 expansion; each would need a separately declared design and reference provenance.
+
+# Downloads and reproducibility
+
+```{r downloads, results='asis'}
+warning_table <- data.frame(warning = unique(warning_log), stringsAsFactors = FALSE)
+if (!nrow(warning_table)) warning_table <- data.frame(warning = "No warnings captured.")
+write.csv(warning_table, file.path(paths[["tables"]], "warnings.csv"), row.names = FALSE)
+writeLines(capture.output(sessionInfo()), file.path(paths[["tables"]], "session_info.txt"))
+if (isTRUE(params$portfolio_snapshot)) {
+  cat("This saved portfolio snapshot links only to compact tracked results. Full tables are regenerated under the configured output directory.\n\n")
+  snapshot_files <- c(
+    "Contrast summary" = "../results/gse186608/contrast_summary.csv",
+    "Top significant-region snapshot" = "../results/gse186608/top_significant_regions.csv"
+  )
+  cat(paste0("- [", names(snapshot_files), "](", snapshot_files, ")", collapse = "\n"))
+} else {
+  table_files <- sort(list.files(paths[["tables"]]))
+  cat(paste0("- [", table_files, "](tables/", table_files, ")", collapse = "\n"))
+}
+```
+
+The manifests record resolved input paths and SHA-256 hashes, code hashes, resolved configuration, software versions, warnings, and the full R session. They document the executed environment without claiming an automatically restorable lockfile.
 
 ```{r session-info}
 sessionInfo()

@@ -57,6 +57,15 @@ assert_error(validate_analysis_inputs(fixture$counts, numeric_metadata, contrast
                                       "~ batch + condition + continuous"),
              "Design variables must be categorical")
 
+numeric_codes <- metadata
+numeric_codes$condition <- ifelse(numeric_codes$condition == "reference", "0", "1")
+numeric_code_contrasts <- contrasts
+numeric_code_contrasts$numerator <- "1"
+numeric_code_contrasts$denominator <- "0"
+assert_error(validate_analysis_inputs(fixture$counts, numeric_codes, numeric_code_contrasts,
+                                      "~ batch + condition"),
+             "numeric-looking values")
+
 write_temp <- function(lines) {
   path <- tempfile(fileext = ".csv")
   writeLines(lines, path)
@@ -108,6 +117,11 @@ assert_error(read_peak_counts(write_temp(c(
   "peak_id,seqnames,start,end,Demo01,Demo02",
   "P1,chrSynthetic,1,10,1.5,2"
 )), "one_based_closed"), "Counts must be non-negative integers")
+
+assert_error(read_peak_counts(write_temp(c(
+  "peak_id,seqnames,start,end,Demo01,Demo02,annotation",
+  "P1,chrSynthetic,1,10,1,2,promoter"
+)), "one_based_closed", sample_ids = c("Demo01", "Demo02")), "unexpected columns")
 
 assert_error(read_peak_counts(write_temp(c(
   "peak_id,seqnames,start,end,Demo01,Demo02",
@@ -163,5 +177,15 @@ bad_config$annotation$enabled <- TRUE
 bad_config_path <- tempfile(fileext = ".R")
 writeLines(c("analysis_config <-", capture.output(dput(bad_config))), bad_config_path)
 assert_error(load_analysis_config(bad_config_path), "must exactly match peak genome build")
+
+statuses <- classify_result_status(
+  c(0, 3, 8, 9, 10, 11), c(FALSE, FALSE, TRUE, TRUE, TRUE, TRUE),
+  c(NA, NA, NA, 0.2, 0.1, 0.001), c(NA, NA, NA, NA, 0.5, 0.01),
+  c(FALSE, FALSE, FALSE, FALSE, FALSE, TRUE)
+)
+assert_true(identical(statuses, c(
+  "all_zero", "low_count_filtered", "unavailable", "independent_filtered",
+  "tested_nonsignificant", "significant"
+)), "Result-status semantics changed.")
 
 cat("All dependency-free validation and fixture tests passed.\n")
