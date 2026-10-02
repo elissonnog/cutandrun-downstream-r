@@ -345,9 +345,10 @@ make_pca_plot <- function(transformed, metadata, top_peaks = 500L, plot_title = 
   data <- data.frame(sample_id = rownames(pca$x), PC1 = pca$x[, 1L], PC2 = pca$x[, 2L],
                      metadata[rownames(pca$x), , drop = FALSE], check.names = FALSE)
   color_variable <- if ("condition" %in% names(data)) "condition" else names(metadata)[1L]
+  data$display_label <- if ("plot_label" %in% names(data)) data$plot_label else data$sample_id
   ggplot2::ggplot(data, ggplot2::aes(x = PC1, y = PC2, color = .data[[color_variable]])) +
     ggplot2::geom_point(size = 3) +
-    ggplot2::geom_text(ggplot2::aes(label = sample_id), vjust = -0.8, size = 3.4,
+    ggplot2::geom_text(ggplot2::aes(label = display_label), vjust = -0.8, size = 3.4,
                        check_overlap = TRUE, show.legend = FALSE) +
     ggplot2::labs(title = plot_title, x = sprintf("PC1 (%.1f%%)", variance[1L]),
                   y = sprintf("PC2 (%.1f%%)", variance[2L]), color = color_variable) +
@@ -361,10 +362,14 @@ make_library_qc_plot <- function(counts, metadata, plot_title = "Peak-count libr
     check.names = FALSE
   )
   color_variable <- if ("condition" %in% names(data)) "condition" else names(metadata)[1L]
+  data$display_label <- if ("plot_label" %in% names(data)) data$plot_label else data$sample_id
+  label_offsets <- c(-1.0, 1.4, -1.0, 1.4, 2.2, -2.0)
+  data$label_vjust <- rep(label_offsets, length.out = nrow(data))
   ggplot2::ggplot(data, ggplot2::aes(x = total_counts, y = detected_peaks,
-                                    color = .data[[color_variable]], label = sample_id)) +
+                                    color = .data[[color_variable]], label = display_label)) +
     ggplot2::geom_point(size = 3) +
-    ggplot2::geom_text(vjust = -0.8, size = 3.4, check_overlap = TRUE, show.legend = FALSE) +
+    ggplot2::geom_text(ggplot2::aes(vjust = label_vjust), size = 3.4,
+                       check_overlap = FALSE, show.legend = FALSE) +
     ggplot2::scale_x_continuous(labels = function(x) format(x, big.mark = ",", scientific = FALSE)) +
     ggplot2::scale_y_continuous(labels = function(x) format(x, big.mark = ",", scientific = FALSE)) +
     ggplot2::labs(title = plot_title, x = "Total counts in consensus peaks",
@@ -386,32 +391,120 @@ make_volcano_plot <- function(result_table, label, fdr, data_label = NULL) {
     ggplot2::theme_minimal(base_size = 11)
 }
 
+make_ma_plot <- function(result_table, label, fdr, data_label = NULL) {
+  plot_data <- result_table[result_table$baseMean > 0 & is.finite(result_table$log2FoldChange), ]
+  ggplot2::ggplot(plot_data, ggplot2::aes(x = baseMean, y = log2FoldChange, color = direction)) +
+    ggplot2::geom_point(alpha = 0.65, size = 1.2, na.rm = TRUE) +
+    ggplot2::scale_x_log10() +
+    ggplot2::scale_color_manual(values = c(increased = "#B2182B", decreased = "#2166AC",
+                                           not_significant = "#BDBDBD")) +
+    ggplot2::geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.4) +
+    ggplot2::labs(
+      title = if (is.null(data_label)) label else paste(data_label, label, sep = ": "),
+      subtitle = paste0("Unshrunken DESeq2 estimates; significance is padj < ", fdr),
+      x = "Mean normalized count", y = "log2 fold change", color = NULL
+    ) +
+    ggplot2::theme_minimal(base_size = 11)
+}
+
 save_ggplot <- function(plot, path, width = 7, height = 5) {
   ggplot2::ggsave(path, plot = plot, width = width, height = height, units = "in", dpi = 150)
   invisible(path)
 }
 
-save_correlation_heatmap <- function(transformed, path, plot_title = "Sample correlation") {
+save_correlation_heatmap <- function(transformed, path, plot_title = "Sample correlation", metadata = NULL) {
   correlation <- stats::cor(SummarizedExperiment::assay(transformed), method = "pearson")
+  if (!is.null(metadata) && "plot_label" %in% names(metadata)) {
+    labels <- as.character(metadata[colnames(correlation), "plot_label"])
+    colnames(correlation) <- labels
+    rownames(correlation) <- labels
+  }
   grDevices::png(path, width = 1400, height = 1200, res = 160)
   on.exit(grDevices::dev.off(), add = TRUE)
   stats::heatmap(correlation, symm = TRUE, margins = c(9, 9), main = plot_title)
   invisible(path)
 }
 
-save_top_peak_heatmap <- function(transformed, path, result_table, top_peaks = 30L,
-                                  plot_title = "Top differential peaks") {
+rank_significant_peaks <- function(result_table, fdr, max_peaks) {
+  significant <- result_table[!is.na(result_table$padj) & result_table$padj < fdr, , drop = FALSE]
+  significant <- significant[order(significant$padj, -abs(significant$log2FoldChange),
+                                   significant$peak_id), , drop = FALSE]
+  head(significant, max_peaks)
+}
+
+save_significant_peak_heatmap <- function(transformed, metadata, path, result_table, fdr,
+                                          max_peaks = 30L,
+                                          plot_title = "Significant peak replicate heatmap") {
   matrix <- SummarizedExperiment::assay(transformed)
-  ranking <- result_table$padj
-  ranking[is.na(ranking)] <- Inf
-  ranked <- result_table$peak_id[order(ranking, -abs(result_table$log2FoldChange), na.last = TRUE)]
-  selected <- head(intersect(ranked, rownames(matrix)), top_peaks)
-  if (length(selected) < 2L) stop("Fewer than two peaks available for the heatmap.")
-  centered <- t(scale(t(matrix[selected, , drop = FALSE]), center = TRUE, scale = FALSE))
-  grDevices::png(path, width = 1400, height = 1200, res = 160)
+  all_significant <- rank_significant_peaks(result_table, fdr, nrow(result_table))
+  selected <- head(intersect(all_significant$peak_id, rownames(matrix)), max_peaks)
+  total_significant <- nrow(all_significant)
+  grDevices::png(path, width = 1600, height = 1400, res = 170)
   on.exit(grDevices::dev.off(), add = TRUE)
-  stats::heatmap(centered, scale = "none", margins = c(8, 8), main = plot_title)
-  invisible(path)
+  if (length(selected) < 2L) {
+    graphics::plot.new()
+    graphics::title(main = plot_title)
+    graphics::text(0.5, 0.5, paste("Fewer than two peaks meet padj <", fdr))
+    return(invisible(list(path = path, selected_n = length(selected), significant_n = total_significant)))
+  }
+  centered <- sweep(matrix[selected, , drop = FALSE], 1L,
+                    rowMeans(matrix[selected, , drop = FALSE]), FUN = "-")
+  row_order <- stats::hclust(stats::dist(centered))$order
+  centered <- centered[row_order, , drop = FALSE]
+  condition_variable <- if ("condition" %in% names(metadata)) "condition" else names(metadata)[1L]
+  conditions <- as.character(metadata[colnames(centered), condition_variable])
+  condition_levels <- unique(conditions)
+  condition_palette <- grDevices::hcl.colors(length(condition_levels), "Dark 3")
+  names(condition_palette) <- condition_levels
+  sample_colors <- unname(condition_palette[conditions])
+  limit <- max(abs(centered))
+  heat_colors <- grDevices::colorRampPalette(c("#2166AC", "#F7F7F7", "#B2182B"))(101L)
+
+  graphics::layout(matrix(c(1, 2, 3), ncol = 1L), heights = c(0.35, 5, 0.75))
+  graphics::par(oma = c(0, 0, 3.3, 0), mar = c(0, 5, 1, 13))
+  graphics::plot.new()
+  graphics::plot.window(xlim = c(0.5, ncol(centered) + 0.5), ylim = c(0, 1))
+  for (index in seq_len(ncol(centered))) {
+    graphics::rect(index - 0.5, 0, index + 0.5, 1,
+                   col = sample_colors[index], border = NA)
+  }
+  graphics::mtext("Condition", side = 2, line = 2.5, cex = 0.8)
+
+  graphics::par(mar = c(6, 5, 0.5, 13))
+  graphics::image(
+    x = seq_len(ncol(centered)), y = seq_len(nrow(centered)), z = t(centered),
+    col = heat_colors, zlim = c(-limit, limit), axes = FALSE, xlab = "", ylab = "",
+    useRaster = TRUE
+  )
+  sample_labels <- if ("plot_label" %in% names(metadata)) {
+    as.character(metadata[colnames(centered), "plot_label"])
+  } else {
+    colnames(centered)
+  }
+  graphics::axis(1, at = seq_len(ncol(centered)), labels = sample_labels, las = 2, cex.axis = 0.8)
+  graphics::axis(4, at = seq_len(nrow(centered)), labels = rownames(centered),
+                 las = 1, cex.axis = 0.55, tick = FALSE)
+
+  graphics::par(mar = c(1, 5, 0, 13))
+  graphics::plot.new()
+  graphics::plot.window(xlim = c(0, 1), ylim = c(0, 1))
+  key_x <- seq(0.05, 0.43, length.out = length(heat_colors) + 1L)
+  for (index in seq_along(heat_colors)) {
+    graphics::rect(key_x[index], 0.38, key_x[index + 1L], 0.64,
+                   col = heat_colors[index], border = NA)
+  }
+  graphics::text(c(0.05, 0.24, 0.43), 0.2,
+                 labels = format(c(-limit, 0, limit), digits = 2), cex = 0.75)
+  graphics::text(0.24, 0.86, "Row-centered VST", cex = 0.8)
+  graphics::legend("right", legend = condition_levels, fill = condition_palette,
+                   title = condition_variable, bty = "n", horiz = TRUE, cex = 0.75)
+  graphics::mtext(plot_title, outer = TRUE, side = 3, line = 1.6, cex = 1.15, font = 2)
+  graphics::mtext(
+    sprintf("Top %d of %d peaks with padj < %s; rows clustered, samples shown in input order",
+            length(selected), total_significant, format(fdr)),
+    outer = TRUE, side = 3, line = 0.25, cex = 0.78
+  )
+  invisible(list(path = path, selected_n = length(selected), significant_n = total_significant))
 }
 
 annotate_peaks_optional <- function(peaks, config) {
