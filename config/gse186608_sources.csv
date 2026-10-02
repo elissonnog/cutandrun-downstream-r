@@ -1,0 +1,3 @@
+file,url,sha256,bytes,pin
+raw_counts_H3K27ac_CnR.tab,https://raw.githubusercontent.com/atmaivancevic/ERV_cancer_enhancers/v1.0/4_mapk_signaling/raw_counts_H3K27ac_CnR.tab,318b65587c2290d807d39ac56479b82e648ed04e8faa0fb8ebc1cadf99681fe4,1626748,v1.0/faeef682bebdfb982c70b47a5d7df4ac77f61264
+ALL_K27ac_CnR_top20k_peaks.bed,https://raw.githubusercontent.com/atmaivancevic/ERV_cancer_enhancers/v1.0/4_mapk_signaling/ALL_K27ac_CnR_top20k_peaks.bed,8c629e276cb24da3a07accc8d9e5461c99bc371840d4d4fcfc77594722229f7f,1375805,v1.0/faeef682bebdfb982c70b47a5d7df4ac77f61264
